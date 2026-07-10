@@ -1,0 +1,293 @@
+# -*- coding: utf-8 -*-
+"""
+图3代码：FD001数据集1号涡扇发动机的退化变点识别与特征通道演化规律
+    （a）基于累积稀疏能量控制图确定的双时间线（t0和t_a）的演变趋势；
+    （b）变点t_a下的特征通道动态演变规律。
+
+对应正文方法论：
+  第3.1.1节 监控统计量（式13-15）：在线单步正交投影 L_t=U_r U_r^T x_t, S_t=x_t-L_t，
+            累积稀疏能量 E(t)=sum_i|S_t,i|
+  第3.1.2节 Shewhart控制图与控制限CL/UCL/LCL、连续N步确认准则（式16-20），
+            得到报警时刻 t0
+  第3.1.3节 反向两阶段方差寻优，在[1,t0]内定位真实退化变点 t_a（式21-23）
+  第3.1.4节 退化严重性量化 V(t)（式24）
+  第3.2.1节 多通道特征 x_t^L（去噪信号）、x_t^S（异常强度）、B(t)（变点二值指示器）、
+            V(t)（严重性分数），式(25)-(28)
+
+数据路径（严格按题目给定，本图只使用FD001）：
+    train = "D:\\pycharm\\PythonProject.idea\\train_FD001.txt"
+    test  = "D:\\pycharm\\PythonProject.idea\\test_FD001.txt"
+    rul   = "D:\\pycharm\\PythonProject.idea\\RUL_FD001.txt"（本图不直接使用RUL标签，
+                                                                仅为路径统一而保留）
+
+依赖：numpy, pandas, matplotlib
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ------------------------------------------------------------------
+# 0. 全局设置
+# ------------------------------------------------------------------
+np.random.seed(0)
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+
+TRAIN_PATH = r"D:\pycharm\PythonProject\.idea\train_FD001.txt"
+TEST_PATH = r"D:\pycharm\PythonProject\.idea\test_FD001.txt"
+RUL_PATH = r"D:\pycharm\PythonProject\.idea\RUL_FD001.txt"  # 未直接使用，仅保留路径
+
+# 21个原始传感器列名
+ALL_SENSOR_COLS = [f's{i}' for i in range(1, 22)]
+COLS = ['unit', 'cycle', 'os1', 'os2', 'os3'] + ALL_SENSOR_COLS
+
+# 4.2节：筛选后保留的11个动态敏感传感器（表2）
+KEEP_SENSORS = ['s2', 's3', 's4', 's7', 's11', 's12', 's14', 's15', 's17', 's20', 's21']
+
+# 3.1.2 / 3.1.3 节参数
+K_SIGMA = 2.5             # 自适应控制阈值系数 k_sigma
+N_CONFIRM = 5              # 连续N步确认准则
+SMOOTH_WIN = 5             # 局部平滑移动均值窗口
+HEALTHY_FRAC = 0.2         # 健康阶段比例 alpha（用于估计U_r及控制限）
+ENERGY_THRESH = 0.95       # 低秩子空间保留能量比例，用于自动选取r
+
+
+# ------------------------------------------------------------------
+# 1. 数据读取与预处理
+# ------------------------------------------------------------------
+def load_cmapss(path):
+    return pd.read_csv(path, sep=r'\s+', header=None, names=COLS)
+
+
+def zscore_fit(df, sensors):
+    mu = df[sensors].mean()
+    sigma = df[sensors].std().replace(0, 1.0)
+    return mu, sigma
+
+
+def zscore_apply(df, sensors, mu, sigma):
+    out = df.copy()
+    out[sensors] = (out[sensors] - mu) / sigma
+    return out
+
+
+# ------------------------------------------------------------------
+# 2. RPCA（Inexact ALM）——公式(3)-(6)
+# ------------------------------------------------------------------
+def rpca_ialm(D, lam=None, tol=1e-7, max_iter=200):
+    """
+    鲁棒主成分分析的非精确增广拉格朗日乘子法(Inexact ALM)求解。
+    D = L + S,  min ||L||_* + lambda*||S||_1
+    """
+    m, n = D.shape
+    if lam is None:
+        lam = 1.0 / np.sqrt(max(m, n))                # 式(4)
+
+    norm2 = np.linalg.norm(D, 2)
+    norminf = np.linalg.norm(D, np.inf) / lam
+    Y = D / max(norm2, norminf)
+    mu = 1.25 / norm2
+    rho = 1.5
+    normD = np.linalg.norm(D, 'fro')
+
+    L = np.zeros_like(D)
+    S = np.zeros_like(D)
+
+    for _ in range(max_iter):
+        # 低秩分量更新：奇异值阈值算子，式(6)
+        U, sv, Vt = np.linalg.svd(D - S + Y / mu, full_matrices=False)
+        sv_th = np.maximum(sv - 1.0 / mu, 0.0)
+        L = (U * sv_th) @ Vt
+
+        # 稀疏分量更新：软阈值算子，式(5)
+        X1 = D - L + Y / mu
+        S = np.sign(X1) * np.maximum(np.abs(X1) - lam / mu, 0.0)
+
+        Z = D - L - S
+        Y = Y + mu * Z
+        mu = mu * rho
+
+        if np.linalg.norm(Z, 'fro') / normD < tol:
+            break
+    return L, S
+
+
+def build_healthy_subspace(X_healthy, energy_ratio=ENERGY_THRESH):
+    """
+    对健康阶段数据做一次性RPCA，再对低秩部分做SVD，
+    按能量比例阈值自动选取前r个正交基，得到 U_r （式13-14 在线投影的基础）。
+
+    注意：X_healthy 形状为 (样本数m, 传感器数n)。要得到能作用在单个
+    时刻传感器特征向量 x_t (∈R^n) 上的投影基 U_r（形状应为 n×r），必须取
+    右奇异向量 V（对应传感器维度），而不是左奇异向量 U（对应样本维度）。
+    """
+    L_healthy, _ = rpca_ialm(X_healthy)
+    _, sv, Vt = np.linalg.svd(L_healthy, full_matrices=False)   # Vt: (k, n)
+    V = Vt.T                                                    # V:  (n, k)
+    energy = np.cumsum(sv ** 2) / np.sum(sv ** 2)
+    r = int(np.searchsorted(energy, energy_ratio) + 1)
+    r = max(1, min(r, V.shape[1]))
+    U_r = V[:, :r]                                              # (n, r)
+    return U_r, r
+
+
+def online_project(X, U_r):
+    """在线单步正交投影，式(13)-(14)：L_t = U_r U_r^T x_t，S_t = x_t - L_t"""
+    L = X @ U_r @ U_r.T
+    S = X - L
+    return L, S
+
+
+# ------------------------------------------------------------------
+# 3. Shewhart控制图 + 变点确认 + 反向两阶段方差寻优 —— 式(15)-(23)
+# ------------------------------------------------------------------
+def cumulative_sparse_energy(S):
+    """式(15)：E(t) = sum_i |S_t,i|"""
+    return np.sum(np.abs(S), axis=1)
+
+
+def moving_average(x, win):
+    if win <= 1:
+        return x.copy()
+    kernel = np.ones(win) / win
+    pad = win - 1
+    xp = np.concatenate([np.full(pad, x[0]), x])
+    return np.convolve(xp, kernel, mode='valid')
+
+
+def detect_alarm_time(E, UCL, n_confirm=N_CONFIRM, smooth_win=SMOOTH_WIN):
+    """式(18)-(20)控制限 + 连续N步确认准则，得到报警时刻 t0（0-based索引）。"""
+    Es = moving_average(E, smooth_win)
+    above = Es > UCL
+    run = 0
+    for t in range(len(Es)):
+        if above[t]:
+            run += 1
+            if run >= n_confirm:
+                return t - n_confirm + 1, Es
+        else:
+            run = 0
+    return len(E) - 1, Es  # 若全程未报警，退化到最后一个点
+
+
+def backward_search_change_point(E, t0):
+    """式(21)-(23)：在区间[1, t0]上通过两阶段内部方差之和最小化，反向搜索真实变点 t_a。"""
+    if t0 < 2:
+        return 0
+    best_k, best_val = 1, np.inf
+    for k in range(1, t0):
+        seg1 = E[:k + 1]
+        seg2 = E[k + 1:t0 + 1]
+        if len(seg2) == 0:
+            continue
+        val = np.sum((seg1 - seg1.mean()) ** 2) + np.sum((seg2 - seg2.mean()) ** 2)
+        if val < best_val:
+            best_val, best_k = val, k
+    return best_k
+
+
+# ------------------------------------------------------------------
+# 4. 严重性分数 —— 式(24)
+# ------------------------------------------------------------------
+def severity_score(Es, UCL, t_a, eps=1e-6):
+    V = np.zeros_like(Es)
+    if t_a >= len(Es) - 1:
+        return V
+    seg = Es[t_a:]
+    denom = (seg.max() - UCL) + eps
+    denom = denom if denom > eps else eps
+    V[t_a:] = (seg - UCL) / denom
+    V = np.clip(V, 0.0, 1.0)
+    return V
+
+
+# ------------------------------------------------------------------
+# 5. 主流程：FD001测试集1号涡扇发动机案例
+# ------------------------------------------------------------------
+def main():
+    train_df = load_cmapss(TRAIN_PATH)
+    test_df = load_cmapss(TEST_PATH)
+
+    mu, sigma = zscore_fit(train_df, KEEP_SENSORS)
+    train_df = zscore_apply(train_df, KEEP_SENSORS, mu, sigma)
+    test_df = zscore_apply(test_df, KEEP_SENSORS, mu, sigma)
+
+    # ---- 用训练集中所有机组前HEALTHY_FRAC比例的健康数据构建健康低秩子空间 U_r ----
+    healthy_rows = []
+    for uid, g in train_df.groupby('unit'):
+        g = g.sort_values('cycle')
+        n_h = max(5, int(len(g) * HEALTHY_FRAC))
+        healthy_rows.append(g[KEEP_SENSORS].values[:n_h])
+    X_healthy = np.vstack(healthy_rows)
+    U_r, r = build_healthy_subspace(X_healthy)
+    print(f"健康低秩子空间维数 r = {r}")
+
+    # ---- 健康阶段稀疏能量估计控制限 CL/UCL/LCL，式(16)-(20) ----
+    _, S_healthy = online_project(X_healthy, U_r)
+    E_healthy = cumulative_sparse_energy(S_healthy)
+    mu_E, sigma_E = E_healthy.mean(), E_healthy.std()
+    CL = mu_E
+    UCL = mu_E + K_SIGMA * sigma_E
+    LCL = max(mu_E - K_SIGMA * sigma_E, 0.0)
+    print(f"CL={CL:.4f}, UCL={UCL:.4f}, LCL={LCL:.4f}")
+
+    # ---- 案例机组：FD001测试集1号发动机 ----
+    unit_id = test_df['unit'].unique()[0]
+    g = test_df[test_df['unit'] == unit_id].sort_values('cycle')
+    X = g[KEEP_SENSORS].values
+    cycles = g['cycle'].values
+
+    L, S = online_project(X, U_r)
+    E = cumulative_sparse_energy(S)
+
+    t0, Es = detect_alarm_time(E, UCL)
+    t_a = backward_search_change_point(E, t0)
+    print(f"发动机#{unit_id}：报警时刻 t0(cycle)={cycles[t0]} (index={t0}), "
+          f"真实退化变点 t_a(cycle)={cycles[t_a]} (index={t_a})")
+
+    # ---- 四通道特征 ----
+    B = np.zeros(len(cycles))
+    B[t_a:] = 1.0
+    V = severity_score(Es, UCL, t_a)
+    x_L_mean = L.mean(axis=1)          # 去噪信号通道（跨传感器均值，便于可视化）
+    x_S_mean = np.abs(S).mean(axis=1)  # 异常强度通道（跨传感器均值）
+
+    # ------------------------------------------------------------------
+    # 6. 绘制图3：(a) 控制图 + 双时间线；(b) 四通道特征演化
+    # ------------------------------------------------------------------
+    fig, axes = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
+
+    ax = axes[0]
+    ax.plot(cycles, E, color='steelblue', lw=1, alpha=0.6, label=r'$E(t)$ (原始累积稀疏能量)')
+    ax.plot(cycles, Es, color='navy', lw=2, label=r'$E_s(t)$ (平滑趋势)')
+    ax.axhline(UCL, color='red', ls='--', lw=1.2, label='UCL')
+    ax.axhline(CL, color='green', ls='--', lw=1, label='CL')
+    ax.axvline(cycles[t0], color='orange', ls='-.', lw=1.5, label=r'报警时刻 $t_0$')
+    ax.axvline(cycles[t_a], color='purple', ls='-', lw=1.5, label=r'真实变点 $t_a$')
+    ax.set_ylabel('累积稀疏能量 E(t)')
+    ax.set_title(f'(a) FD001 发动机#{unit_id}：基于累积稀疏能量控制图确定的双时间线 '
+                 f'($t_0$={cycles[t0]}, $t_a$={cycles[t_a]})')
+    ax.legend(loc='upper left', fontsize=8)
+
+    ax2 = axes[1]
+    ax2.plot(cycles, x_L_mean, color='seagreen', lw=1.5, label=r'去噪信号 $x_t^{L}$ (均值)')
+    ax2.plot(cycles, x_S_mean, color='darkorange', lw=1.5, label=r'异常强度 $x_t^{S}$ (均值)')
+    ax2.plot(cycles, B, color='black', lw=1.5, ls='--', label=r'变点指示器 $B(t)$')
+    ax2.plot(cycles, V, color='crimson', lw=1.5, label=r'严重性分数 $V(t)$')
+    ax2.axvline(cycles[t_a], color='purple', ls='-', lw=1.5)
+    ax2.set_xlabel('运行周期 (cycle)')
+    ax2.set_ylabel('特征通道数值')
+    ax2.set_title(f'(b) 变点 $t_a$={cycles[t_a]} 下的特征通道动态演变规律')
+    ax2.legend(loc='upper left', fontsize=8)
+
+    plt.suptitle(f'图3 FD001数据集{unit_id}号涡扇发动机的退化变点识别与特征通道演化规律', y=1.0)
+    plt.tight_layout()
+    out_path = "fig3_change_point_case_study.png"
+    plt.savefig(out_path, dpi=300)
+    print(f"图3已保存至：{out_path}")
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
